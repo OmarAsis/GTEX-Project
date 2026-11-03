@@ -1,0 +1,34 @@
+{
+  "samples": {
+    "tissue": "Muscle - Skeletal",
+    "SMAFRZE": "RNASEQ"
+  },
+  "normalization": "CPM (counts / library size * 1e6)",
+  "gene_filter": {
+    "min_cpm": 1,
+    "min_samples": 10,
+    "n_after_filter": 17224
+  },
+  "transformation": "log1p(CPM)",
+  "covariate_correction": {
+    "numeric": [
+      "SMNTRNRT",
+      "SMEXNCRT",
+      "SEX"
+    ],
+    "categorical": [
+      "DTHHRDY"
+    ],
+    "missing_category": "Missing"
+  },
+  "gene_selection": {
+    "method": "top variance after correction",
+    "top_n": 5000,
+    "n_selected": 5000
+  },
+  "pca_diagnostics": {
+    "components_for_scree_plot": 10,
+    "components_checked_against_covariates": 3,
+    "random_state": 42
+  }
+}

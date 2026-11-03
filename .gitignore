@@ -1,0 +1,24 @@
+# Environments and interpreter artifacts
+.venv/
+sklearn-env/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+
+# Local source data; see data/README.md for the required GTEx v8 files
+/data/*
+!/data/README.md
+
+# Derived expression matrices and network tables are reproducible, large outputs
+/src/*.parquet
+/src/processed/**/*.parquet
+/src/processed/**/mplconfig/
+/src/*.csv
+/src/processed/**/*.csv
+/src/processed/**/*.png
+
+# Local logs and editor files
+*.log
+.idea/
+.vscode/
