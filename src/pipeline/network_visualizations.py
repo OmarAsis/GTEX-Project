@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 from typing import Any
 
 from shared.paths import PROCESSED
 FIGURES = PROCESSED / "network_figures"
-VISUALIZATION_THRESHOLD = 0.65  # Pre-existing primary value; tradeoff examined in network_notebook, citations later.
+VISUALIZATION_THRESHOLD = 0.65
 os.environ.setdefault("MPLCONFIGDIR", str(PROCESSED / "mplconfig"))
 
 import matplotlib
@@ -24,22 +23,16 @@ from matplotlib.lines import Line2D
 
 from shared.pipeline_utils import write_json
 
-def _gene_label(symbol: Any, gene_id: str) -> str:
-    return str(symbol) if pd.notna(symbol) and str(symbol).strip() else gene_id
-
-
 def run() -> dict[str, Any]:
     FIGURES.mkdir(parents=True, exist_ok=True)
     expression = pd.read_parquet(PROCESSED / "muscle_logcpm_corrected_top5000.parquet")
     symbols = pd.read_parquet(PROCESSED / "gene_symbols.parquet")["symbol"]
-    # Pearson is the displayed network; method agreement is compared in network_notebook, citations later.
     edges = pd.read_parquet(
         PROCESSED / f"network_edges_pearson_abs{VISUALIZATION_THRESHOLD:.2f}.parquet"
     )
     hubs = pd.read_parquet(
         PROCESSED / f"network_hubs_pearson_abs{VISUALIZATION_THRESHOLD:.2f}.parquet"
     )
-    # These are the locked matrix and tables produced by the immediately preceding pipeline stages.
     graph = nx.Graph()
     graph.add_nodes_from(expression.index.astype(str))
     graph.add_edges_from(
@@ -48,14 +41,14 @@ def run() -> dict[str, Any]:
     )
     degrees = dict(graph.degree())
 
-    top_hubs = hubs.head(15).copy()  # Report window reviewed in network_notebook; proved in notebook citations later.
+    top_hubs = hubs.head(15).copy()
     top_hubs["label"] = [
         _gene_label(symbol, gene_id)
         for symbol, gene_id in zip(top_hubs["symbol"], top_hubs["gene_id"])
     ]
 
     # --- Graph 1/4: Pearson correlation heatmap for the top 200 variance-ranked genes. ---
-    ordered_genes = expression.index[:200].astype(str).tolist()  # Heatmap display limit reviewed in network_notebook; proved in notebook citations later.
+    ordered_genes = expression.index[:200].astype(str).tolist()
     correlation = expression.loc[ordered_genes].T.corr(method="pearson")
     fig, ax = plt.subplots(figsize=(9, 8))
     image = ax.imshow(correlation.to_numpy(), cmap="coolwarm", vmin=-1, vmax=1, interpolation="nearest")
@@ -79,8 +72,8 @@ def run() -> dict[str, Any]:
         graph.neighbors(center_id),
         key=lambda gene: graph[center_id][gene]["weight"],
         reverse=True,
-    )[:30]  # Local-graph display limit reviewed in network_notebook; proved in notebook citations later.
-    ego = graph.subgraph([center_id, *top_neighbors]).copy()
+    )[:30]
+    ego = graph.subgraph([center_id, *top_neighbors])
     display_graph = nx.Graph()
     display_graph.add_nodes_from(ego.nodes(data=True))
     display_graph.add_edges_from(
@@ -198,6 +191,9 @@ def run() -> dict[str, Any]:
     print(json.dumps(result, indent=2), flush=True)
     return result
 
+
+def _gene_label(symbol: Any, gene_id: str) -> str:
+    return str(symbol) if pd.notna(symbol) and str(symbol).strip() else gene_id
 
 if __name__ == "__main__":
     run()

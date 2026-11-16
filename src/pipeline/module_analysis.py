@@ -18,53 +18,6 @@ RESOLUTION = 1.0
 MIN_MODULE_SIZE = 10
 RANDOM_STATE = 42
 
-def _partition_mapping(
-    communities: list[set[str]],
-    gene_order: list[str],
-) -> tuple[dict[str, str], dict[str, str], dict[str, int]]:
-    ordered = sorted(communities, key=lambda group: (-len(group), min(group)))
-    ordered_modules = [group for group in ordered if len(group) >= MIN_MODULE_SIZE]
-    community_by_gene: dict[str, str] = {}
-    module_by_gene: dict[str, str] = {}
-    size_by_community: dict[str, int] = {}
-    for position, group in enumerate(ordered, start=1):
-        community_id = f"C{position:04d}"
-        size_by_community[community_id] = len(group)
-        module_id = None
-        if len(group) >= MIN_MODULE_SIZE:
-            module_position = ordered_modules.index(group) + 1
-            module_id = f"M{module_position:03d}"
-        for gene in group:
-            community_by_gene[gene] = community_id
-            module_by_gene[gene] = module_id or "M0"
-    if set(community_by_gene) != set(gene_order):
-        raise AssertionError("Partition does not cover the expression matrix gene set")
-    return community_by_gene, module_by_gene, size_by_community
-
-
-def _correlation(values_a: np.ndarray, values_b: np.ndarray) -> float:
-    return float(np.corrcoef(values_a, values_b)[0, 1])
-
-
-def _module_eigengene(
-    expression: pd.DataFrame,
-    module_genes: list[str],
-) -> tuple[np.ndarray, float, np.ndarray]:
-    values = expression.loc[module_genes].to_numpy(dtype=np.float64)
-    gene_means = values.mean(axis=1, keepdims=True)
-    gene_sd = values.std(axis=1, ddof=1, keepdims=True)
-    if (gene_sd == 0).any() or not np.isfinite(gene_sd).all():
-        raise ValueError("A module gene has zero or invalid variance")
-    standardized = ((values - gene_means) / gene_sd).T
-    pca = PCA(n_components=1, svd_solver="randomized", random_state=RANDOM_STATE)
-    eigengene = pca.fit_transform(standardized).ravel()
-    kme = np.array([_correlation(values[i], eigengene) for i in range(len(module_genes))])
-    if np.nanmean(kme) < 0:
-        eigengene *= -1
-        kme *= -1
-    return eigengene, float(pca.explained_variance_ratio_[0]), kme
-
-
 def run() -> dict[str, Any]:
     expression = pd.read_parquet(PROCESSED / "muscle_logcpm_corrected_top5000.parquet")
     metadata = pd.read_parquet(PROCESSED / "muscle_metadata.parquet")
@@ -299,6 +252,52 @@ def run() -> dict[str, Any]:
     }, indent=2, allow_nan=False), flush=True)
     return result
 
+
+def _partition_mapping(
+    communities: list[set[str]],
+    gene_order: list[str],
+) -> tuple[dict[str, str], dict[str, str], dict[str, int]]:
+    ordered = sorted(communities, key=lambda group: (-len(group), min(group)))
+    ordered_modules = [group for group in ordered if len(group) >= MIN_MODULE_SIZE]
+    community_by_gene: dict[str, str] = {}
+    module_by_gene: dict[str, str] = {}
+    size_by_community: dict[str, int] = {}
+    for position, group in enumerate(ordered, start=1):
+        community_id = f"C{position:04d}"
+        size_by_community[community_id] = len(group)
+        module_id = None
+        if len(group) >= MIN_MODULE_SIZE:
+            module_position = ordered_modules.index(group) + 1
+            module_id = f"M{module_position:03d}"
+        for gene in group:
+            community_by_gene[gene] = community_id
+            module_by_gene[gene] = module_id or "M0"
+    if set(community_by_gene) != set(gene_order):
+        raise AssertionError("Partition does not cover the expression matrix gene set")
+    return community_by_gene, module_by_gene, size_by_community
+
+
+def _module_eigengene(
+    expression: pd.DataFrame,
+    module_genes: list[str],
+) -> tuple[np.ndarray, float, np.ndarray]:
+    values = expression.loc[module_genes].to_numpy(dtype=np.float64)
+    gene_means = values.mean(axis=1, keepdims=True)
+    gene_sd = values.std(axis=1, ddof=1, keepdims=True)
+    if (gene_sd == 0).any() or not np.isfinite(gene_sd).all():
+        raise ValueError("A module gene has zero or invalid variance")
+    standardized = ((values - gene_means) / gene_sd).T
+    pca = PCA(n_components=1, svd_solver="randomized", random_state=RANDOM_STATE)
+    eigengene = pca.fit_transform(standardized).ravel()
+    kme = np.array([_correlation(values[i], eigengene) for i in range(len(module_genes))])
+    if np.nanmean(kme) < 0:
+        eigengene *= -1
+        kme *= -1
+    return eigengene, float(pca.explained_variance_ratio_[0]), kme
+
+
+def _correlation(values_a: np.ndarray, values_b: np.ndarray) -> float:
+    return float(np.corrcoef(values_a, values_b)[0, 1])
 
 if __name__ == "__main__":
     run()

@@ -15,12 +15,174 @@ from scipy.stats import rankdata
 from shared.pipeline_utils import write_json
 
 from shared.paths import PROCESSED
-THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.65, 0.7, 0.8, 0.9]  # Existing sensitivity sweep summarized in network_notebook; citations later.
-CHECKPOINT_THRESHOLD = 0.7  # Pre-existing stricter comparison value; examined in network_notebook, citations later.
-VISUALIZATION_THRESHOLD = 0.65  # Pre-existing primary value; tradeoff examined in network_notebook, citations later.
-TOP_K = [100, 1_000]  # Method-overlap cutoffs reviewed in network_notebook; proved in notebook citations later.
+THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.65, 0.7, 0.8, 0.9]
+VISUALIZATION_THRESHOLD = 0.65
+TOP_K = [100, 1_000]
 SPLIT_REPEATS = 5
 STABILITY_SEED = 42
+
+
+def run() -> dict[str, Any]:
+    expression = pd.read_parquet(PROCESSED / "muscle_logcpm_corrected_top5000.parquet")
+    symbols = pd.read_parquet(PROCESSED / "gene_symbols.parquet")["symbol"]
+    genes = expression.index
+    symbols = symbols.reindex(genes)
+    n_genes = len(genes)
+    expression_values = expression.to_numpy(dtype=np.float64, copy=False)
+    pair_i, pair_j = np.triu_indices(n_genes, k=1)
+    null_values = np.random.default_rng(STABILITY_SEED).permuted(expression_values, axis=1)
+    method_results: dict[str, dict[str, Any]] = {}
+    top_pair_positions: dict[str, dict[int, set[int]]] = {}
+    pearson_values = None
+    edge_keys: dict[str, set[tuple[str, str]]] = {}
+    hub_ids: dict[str, set[str]] = {}
+
+    for method in ["pearson", "spearman"]:
+        correlation = _correlation_matrix(expression, method)
+        if not np.isfinite(correlation).all():
+            raise AssertionError(f"{method} matrix contains missing/non-finite values")
+
+        values = correlation[pair_i, pair_j]
+        top_pair_positions[method] = {k: set(np.argpartition(np.abs(values), -k)[-k:].tolist()) for k in TOP_K}
+        if method == "pearson":
+            pearson_values = values.copy()
+        threshold_rows = [
+            _component_metrics(correlation, pair_i, pair_j, threshold)
+            for threshold in THRESHOLDS
+        ]
+        split_stability = _split_half_stability(expression_values, method, pair_i, pair_j)
+        permutation_null = _permutation_null(
+            method, pair_i, pair_j, null_values
+        )
+        family_background, family_rows = _same_family_enrichment(
+            symbols, genes, values, pair_i, pair_j
+        )
+        split_by_threshold = {row["threshold"]: row for row in split_stability}
+        family_by_threshold = {row["threshold"]: row for row in family_rows}
+        for row in threshold_rows:
+            threshold = row["threshold"]
+            null_edge_count = permutation_null["edges_at_thresholds"][str(threshold)]
+            family = family_by_threshold[threshold]
+            row.update({
+                "split_half_jaccard": split_by_threshold[threshold]["mean_jaccard"],
+                "split_half_jaccard_sd": split_by_threshold[threshold]["sd_jaccard"],
+                "null_edges": null_edge_count,
+                "estimated_false_edge_rate": float(null_edge_count / row["edges"]),
+                "same_family_edges": family["same_family_edges"],
+                "same_family_edge_enrichment": family["enrichment"],
+            })
+        graph, edges, hubs = _build_network(
+            genes, symbols, correlation, pair_i, pair_j, VISUALIZATION_THRESHOLD
+        )
+        network_stats = {
+            "nodes": int(graph.number_of_nodes()),
+            "edges": int(graph.number_of_edges()),
+            "density": float(nx.density(graph)),
+            "mean_degree": float(np.mean([degree for _, degree in graph.degree()])),
+            "mean_weighted_degree": float(np.mean([value for _, value in graph.degree(weight="weight")])),
+            "connected_components": int(nx.number_connected_components(graph)),
+            "isolated_genes": int(len(list(nx.isolates(graph)))),
+            "largest_component": int(max(map(len, nx.connected_components(graph)))),
+        }
+        matrix_stats = {
+            "matrix_shape": [n_genes, n_genes],
+            "unique_pairs": int(len(values)),
+            "diagonal_min": float(np.diag(correlation).min()),
+            "diagonal_max": float(np.diag(correlation).max()),
+            "symmetric": True,
+            "non_finite_values": 0,
+            "distribution": {
+                "mean": float(values.mean()),
+                "sd": float(values.std(ddof=1)),
+                "min": float(values.min()),
+                "q25": float(np.quantile(values, 0.25)),
+                "median": float(np.quantile(values, 0.5)),
+                "q75": float(np.quantile(values, 0.75)),
+                "max": float(values.max()),
+                "fraction_abs_ge_0_5": float((np.abs(values) >= 0.5).mean()),
+                "fraction_abs_ge_0_7": float((np.abs(values) >= 0.7).mean()),
+                "fraction_abs_ge_0_8": float((np.abs(values) >= 0.8).mean()),
+            },
+        }
+        visual_stats = next(row for row in threshold_rows if row["threshold"] == VISUALIZATION_THRESHOLD)
+        if visual_stats["edges"] != network_stats["edges"]:
+            raise AssertionError("NetworkX and sparse threshold edge counts disagree")
+        if visual_stats["components"] != network_stats["connected_components"]:
+            raise AssertionError("NetworkX and sparse connected components disagree")
+        method_results[method] = {
+            "matrix": matrix_stats,
+            "permutation_null": permutation_null,
+            "split_half_stability": split_stability,
+            "same_family_background_fraction": family_background,
+            "threshold_metrics": threshold_rows,
+            "network_at_visualization_threshold": {
+                "threshold_abs_r": VISUALIZATION_THRESHOLD,
+                **network_stats,
+            },
+            "top_15_hubs": hubs.head(15).to_dict(orient="records"),
+        }
+        edge_keys[method] = set(zip(edges["gene_1"], edges["gene_2"]))
+        hub_ids[method] = set(hubs.head(15)["gene_id"])
+
+        edges.to_parquet(
+            PROCESSED / f"network_edges_{method}_abs{VISUALIZATION_THRESHOLD:.2f}.parquet",
+            index=False,
+        )
+        if method == "pearson":
+            hubs.to_parquet(
+                PROCESSED / f"network_hubs_{method}_abs{VISUALIZATION_THRESHOLD:.2f}.parquet",
+                index=False,
+            )
+        print(
+            f"{method}: verified {n_genes:,} genes, {graph.number_of_edges():,} edges at "
+            f"|r| >= {VISUALIZATION_THRESHOLD}",
+            flush=True,
+        )
+
+    method_comparison: dict[str, Any] = {
+        "pearson_spearman_pairwise_correlation": float(np.corrcoef(pearson_values, values)[0, 1]),
+    }
+    for k in TOP_K:
+        p_top, s_top = top_pair_positions["pearson"][k], top_pair_positions["spearman"][k]
+        method_comparison[f"top_{k}_absolute_edges_jaccard"] = float(len(p_top & s_top) / len(p_top | s_top))
+    p_edges, s_edges = edge_keys["pearson"], edge_keys["spearman"]
+    method_comparison["thresholded_network_edge_jaccard"] = float(len(p_edges & s_edges) / len(p_edges | s_edges)) if p_edges | s_edges else None
+    method_comparison["pearson_edges_at_threshold"] = int(len(p_edges))
+    method_comparison["spearman_edges_at_threshold"] = int(len(s_edges))
+    p_hubs, s_hubs = hub_ids["pearson"], hub_ids["spearman"]
+    method_comparison["top_15_hub_id_jaccard"] = float(len(p_hubs & s_hubs) / len(p_hubs | s_hubs))
+
+    result = {
+        "input": {
+            "expression_file": "muscle_logcpm_corrected_top5000.parquet",
+            "orientation": "rows=genes, columns=samples",
+            "shape": list(expression.shape),
+            "genes_unique": bool(expression.index.is_unique),
+            "samples_unique": bool(expression.columns.is_unique),
+            "missing_or_non_finite_values": 0,
+        },
+        "thresholds_tested": THRESHOLDS,
+        "methods": method_results,
+        "method_comparison": method_comparison,
+    }
+    out_path = PROCESSED / "network_analysis.json"
+    write_json(out_path, result, allow_nan=False)
+    print(json.dumps({
+        "status": "PASS",
+        "input": result["input"],
+        "pearson_network": method_results["pearson"]["network_at_visualization_threshold"],
+        "spearman_network": method_results["spearman"]["network_at_visualization_threshold"],
+        "method_comparison": method_comparison,
+        "pearson_hubs": [row["symbol"] for row in method_results["pearson"]["top_15_hubs"]],
+        "results_file": str(out_path),
+    }, indent=2), flush=True)
+    return result
+
+
+def _correlation_matrix(expression: pd.DataFrame, method: str) -> np.ndarray:
+    return _correlation_from_values(
+        expression.to_numpy(dtype=np.float64, copy=False), method
+    )
 
 
 def _correlation_from_values(input_values: np.ndarray, method: str) -> np.ndarray:
@@ -39,12 +201,6 @@ def _correlation_from_values(input_values: np.ndarray, method: str) -> np.ndarra
     np.clip(correlation, -1.0, 1.0, out=correlation)
     np.fill_diagonal(correlation, 1.0)
     return correlation
-
-
-def _correlation_matrix(expression: pd.DataFrame, method: str) -> np.ndarray:
-    return _correlation_from_values(
-        expression.to_numpy(dtype=np.float64, copy=False), method
-    )
 
 
 def _component_metrics(correlation: np.ndarray, pair_i: np.ndarray, pair_j: np.ndarray, threshold: float) -> dict[str, Any]:
@@ -182,183 +338,6 @@ def _build_network(genes: pd.Index, symbols: pd.Series, correlation: np.ndarray,
         }
     )
     return graph, edges, hubs
-
-
-def run() -> dict[str, Any]:
-    expression = pd.read_parquet(PROCESSED / "muscle_logcpm_corrected_top5000.parquet")
-    symbols = pd.read_parquet(PROCESSED / "gene_symbols.parquet")["symbol"]
-    genes = expression.index
-    symbols = symbols.reindex(genes)
-    n_genes = len(genes)
-    expression_values = expression.to_numpy(dtype=np.float64, copy=False)
-    pair_i, pair_j = np.triu_indices(n_genes, k=1)
-    null_values = np.random.default_rng(STABILITY_SEED).permuted(expression_values, axis=1)
-    method_results: dict[str, dict[str, Any]] = {}
-    top_pair_positions: dict[str, dict[int, set[int]]] = {}
-    pearson_values = None
-    edge_keys: dict[str, set[tuple[str, str]]] = {}
-    hub_ids: dict[str, set[str]] = {}
-
-    for method in ["pearson", "spearman"]:
-        correlation = _correlation_matrix(expression, method)
-        if not np.isfinite(correlation).all():
-            raise AssertionError(f"{method} matrix contains missing/non-finite values")
-
-        values = correlation[pair_i, pair_j]
-        top_pair_positions[method] = {k: set(np.argpartition(np.abs(values), -k)[-k:].tolist()) for k in TOP_K}
-        if method == "pearson":
-            pearson_values = values.copy()
-        threshold_rows = [
-            _component_metrics(correlation, pair_i, pair_j, threshold)
-            for threshold in THRESHOLDS
-        ]
-        split_stability = _split_half_stability(expression_values, method, pair_i, pair_j)
-        permutation_null = _permutation_null(
-            method, pair_i, pair_j, null_values
-        )
-        family_background, family_rows = _same_family_enrichment(
-            symbols, genes, values, pair_i, pair_j
-        )
-        split_by_threshold = {row["threshold"]: row for row in split_stability}
-        family_by_threshold = {row["threshold"]: row for row in family_rows}
-        for row in threshold_rows:
-            threshold = row["threshold"]
-            null_edge_count = permutation_null["edges_at_thresholds"][str(threshold)]
-            family = family_by_threshold[threshold]
-            row.update({
-                "split_half_jaccard": split_by_threshold[threshold]["mean_jaccard"],
-                "split_half_jaccard_sd": split_by_threshold[threshold]["sd_jaccard"],
-                "null_edges": null_edge_count,
-                "estimated_false_edge_rate": float(null_edge_count / row["edges"]),
-                "same_family_edges": family["same_family_edges"],
-                "same_family_edge_enrichment": family["enrichment"],
-            })
-        graph, edges, hubs = _build_network(
-            genes, symbols, correlation, pair_i, pair_j, CHECKPOINT_THRESHOLD
-        )
-        visual_graph, visual_edges, visual_hubs = _build_network(
-            genes, symbols, correlation, pair_i, pair_j, VISUALIZATION_THRESHOLD
-        )
-        selected_network_stats = {
-            "nodes": int(graph.number_of_nodes()),
-            "edges": int(graph.number_of_edges()),
-            "density": float(nx.density(graph)),
-            "mean_degree": float(np.mean([degree for _, degree in graph.degree()])),
-            "mean_weighted_degree": float(np.mean([value for _, value in graph.degree(weight="weight")])),
-            "connected_components": int(nx.number_connected_components(graph)),
-            "isolated_genes": int(len(list(nx.isolates(graph)))),
-            "largest_component": int(max(map(len, nx.connected_components(graph)))),
-        }
-        matrix_stats = {
-            "matrix_shape": [n_genes, n_genes],
-            "unique_pairs": int(len(values)),
-            "diagonal_min": float(np.diag(correlation).min()),
-            "diagonal_max": float(np.diag(correlation).max()),
-            "symmetric": True,
-            "non_finite_values": 0,
-            "distribution": {
-                "mean": float(values.mean()),
-                "sd": float(values.std(ddof=1)),
-                "min": float(values.min()),
-                "q25": float(np.quantile(values, 0.25)),
-                "median": float(np.quantile(values, 0.5)),
-                "q75": float(np.quantile(values, 0.75)),
-                "max": float(values.max()),
-                "fraction_abs_ge_0_5": float((np.abs(values) >= 0.5).mean()),
-                "fraction_abs_ge_0_7": float((np.abs(values) >= 0.7).mean()),
-                "fraction_abs_ge_0_8": float((np.abs(values) >= 0.8).mean()),
-            },
-        }
-        check_stats = next(row for row in threshold_rows if row["threshold"] == CHECKPOINT_THRESHOLD)
-        visual_stats = next(row for row in threshold_rows if row["threshold"] == VISUALIZATION_THRESHOLD)
-        if check_stats["edges"] != selected_network_stats["edges"]:
-            raise AssertionError("NetworkX and sparse threshold edge counts disagree")
-        if check_stats["components"] != selected_network_stats["connected_components"]:
-            raise AssertionError("NetworkX and sparse connected components disagree")
-        if visual_stats["edges"] != visual_graph.number_of_edges():
-            raise AssertionError("NetworkX and sparse visualization-threshold edge counts disagree")
-        if visual_stats["components"] != nx.number_connected_components(visual_graph):
-            raise AssertionError("NetworkX and sparse visualization components disagree")
-        method_results[method] = {
-            "matrix": matrix_stats,
-            "permutation_null": permutation_null,
-            "split_half_stability": split_stability,
-            "same_family_background_fraction": family_background,
-            "threshold_metrics": threshold_rows,
-            "network_at_checkpoint_threshold": {
-                "threshold_abs_r": CHECKPOINT_THRESHOLD,
-                **selected_network_stats,
-            },
-            "network_at_visualization_threshold": {
-                "threshold_abs_r": VISUALIZATION_THRESHOLD,
-                "nodes": int(visual_graph.number_of_nodes()),
-                "edges": int(visual_graph.number_of_edges()),
-                "density": float(nx.density(visual_graph)),
-                "isolated_genes": int(len(list(nx.isolates(visual_graph)))),
-                "connected_components": int(nx.number_connected_components(visual_graph)),
-                "largest_component": int(max(map(len, nx.connected_components(visual_graph)))),
-            },
-            "top_15_hubs": hubs.head(15).to_dict(orient="records"),
-            "visualization_top_15_hubs": visual_hubs.head(15).to_dict(orient="records"),
-        }
-        edge_keys[method] = set(zip(edges["gene_1"], edges["gene_2"]))
-        hub_ids[method] = set(hubs.head(15)["gene_id"])
-
-        visual_edges.to_parquet(
-            PROCESSED / f"network_edges_{method}_abs{VISUALIZATION_THRESHOLD:.2f}.parquet",
-            index=False,
-        )
-        if method == "pearson":
-            visual_hubs.to_parquet(
-                PROCESSED / f"network_hubs_{method}_abs{VISUALIZATION_THRESHOLD:.2f}.parquet",
-                index=False,
-            )
-        print(
-            f"{method}: verified {n_genes:,} genes, {graph.number_of_edges():,} edges at "
-            f"|r| >= {CHECKPOINT_THRESHOLD}",
-            flush=True,
-        )
-
-    method_comparison: dict[str, Any] = {
-        "pearson_spearman_pairwise_correlation": float(np.corrcoef(pearson_values, values)[0, 1]),
-    }
-    for k in TOP_K:
-        p_top, s_top = top_pair_positions["pearson"][k], top_pair_positions["spearman"][k]
-        method_comparison[f"top_{k}_absolute_edges_jaccard"] = float(len(p_top & s_top) / len(p_top | s_top))
-    p_edges, s_edges = edge_keys["pearson"], edge_keys["spearman"]
-    method_comparison["thresholded_network_edge_jaccard"] = float(len(p_edges & s_edges) / len(p_edges | s_edges)) if p_edges | s_edges else None
-    method_comparison["pearson_edges_at_threshold"] = int(len(p_edges))
-    method_comparison["spearman_edges_at_threshold"] = int(len(s_edges))
-    p_hubs, s_hubs = hub_ids["pearson"], hub_ids["spearman"]
-    method_comparison["top_15_hub_id_jaccard"] = float(len(p_hubs & s_hubs) / len(p_hubs | s_hubs))
-
-    result = {
-        "input": {
-            "expression_file": "muscle_logcpm_corrected_top5000.parquet",
-            "orientation": "rows=genes, columns=samples",
-            "shape": list(expression.shape),
-            "genes_unique": bool(expression.index.is_unique),
-            "samples_unique": bool(expression.columns.is_unique),
-            "missing_or_non_finite_values": 0,
-        },
-        "thresholds_tested": THRESHOLDS,
-        "checkpoint_threshold_abs_r": CHECKPOINT_THRESHOLD,
-        "methods": method_results,
-        "method_comparison": method_comparison,
-    }
-    out_path = PROCESSED / "network_analysis.json"
-    write_json(out_path, result, allow_nan=False)
-    print(json.dumps({
-        "status": "PASS",
-        "input": result["input"],
-        "pearson_network": method_results["pearson"]["network_at_checkpoint_threshold"],
-        "spearman_network": method_results["spearman"]["network_at_checkpoint_threshold"],
-        "method_comparison": method_comparison,
-        "pearson_hubs": [row["symbol"] for row in method_results["pearson"]["top_15_hubs"]],
-        "results_file": str(out_path),
-    }, indent=2), flush=True)
-    return result
-
 
 if __name__ == "__main__":
     run()
