@@ -39,6 +39,136 @@ PCA_CHECK_COMPONENTS = PCA_DIAGNOSTICS["components_checked_against_covariates"]
 PCA_RANDOM_STATE = PCA_DIAGNOSTICS["random_state"]
 
 
+def run() -> dict[str, Any]:
+    expression = pd.read_parquet(PROCESSED / "muscle_logcpm_filtered.parquet")
+    metadata = pd.read_parquet(PROCESSED / "muscle_metadata_clean.parquet")
+    symbols = pd.read_parquet(PROCESSED / "gene_symbols.parquet")["symbol"]
+    stage1 = read_json(PROCESSED / "preprocessing_stage1_params.json")
+    phenotypes = pd.read_csv(
+        DATA / "GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt", sep="\t"
+    )
+    print(f"Loaded clean matrix {expression.shape}; metadata {metadata.shape}", flush=True)
+
+    if not metadata.index.equals(expression.columns):
+        raise ValueError("Sample metadata and expression columns are misaligned")
+    if not symbols.index.equals(expression.index):
+        raise ValueError("Gene symbols and expression rows are misaligned")
+    if stage1["gene_filter"]["genes_after_filter"] != len(expression):
+        raise ValueError("Stage 1 gene filter report differs from the expression matrix")
+
+    metadata = _add_sample_traits(metadata, phenotypes)
+    sample_corr = expression.corr(method="pearson")
+    print("Computed sample-sample correlations", flush=True)
+    mean_sample_corr = (sample_corr.sum(axis=1) - 1) / (len(sample_corr) - 1)
+
+    pca_before, scores_before = _pca(expression)
+    print("Computed pre-correction PCA", flush=True)
+    numeric_covariates = metadata.loc[:, NUMERIC_COVARIATES].apply(pd.to_numeric, errors="raise")
+    if numeric_covariates.isna().any().any():
+        raise ValueError("A required numeric covariate is missing")
+    covariates = numeric_covariates
+    for name in CATEGORICAL_COVARIATES:
+        categories = metadata[name].astype("string").fillna(COVARIATE_MISSING_CATEGORY)
+        dummies = pd.get_dummies(
+            categories, prefix=name, drop_first=True, dtype=np.float64
+        )
+        covariates = pd.concat([covariates, dummies], axis=1)
+    covariate_sd = covariates.std(axis=0, ddof=1)
+    if covariates.isna().any().any() or (covariate_sd == 0).any():
+        raise ValueError("Covariates contain missing values or a constant column")
+    covariates_z = (covariates - covariates.mean(axis=0)) / covariate_sd
+    design = np.column_stack(
+        [np.ones(len(covariates_z)), covariates_z.to_numpy(dtype=np.float64)]
+    )
+    Y = expression.to_numpy(dtype=np.float64, copy=False).T
+    beta, *_ = np.linalg.lstsq(design, Y, rcond=None)
+    corrected_values = Y - design @ beta + Y.mean(axis=0)
+    print("Regressed covariates from expression matrix", flush=True)
+    corrected = pd.DataFrame(
+        corrected_values.T, index=expression.index, columns=expression.columns
+    )
+    if not np.isfinite(corrected_values).all():
+        raise AssertionError("Covariate-corrected expression has invalid values")
+
+    pca_after, scores_after = _pca(corrected)
+    print("Computed post-correction PCA", flush=True)
+    pc_names = [f"PC{i + 1}" for i in range(PCA_CHECK_COMPONENTS)]
+    pcs_after = pd.DataFrame(
+        scores_after[:, :PCA_CHECK_COMPONENTS], index=corrected.columns, columns=pc_names
+    )
+    corrected_covariate_correlations = {
+        pc: {
+            name: float(numeric_covariates[name].corr(pcs_after[pc]))
+            for name in NUMERIC_COVARIATES
+        }
+        for pc in pcs_after.columns
+    }
+    top_expression = corrected.iloc[
+        np.argsort(-corrected_values.var(axis=0, ddof=1), kind="stable")[:TOP_N_GENES]
+    ]
+    if top_expression.shape != (TOP_N_GENES, len(expression.columns)):
+        raise AssertionError("Final top-variance matrix has an unexpected shape")
+    print(f"Selected top {TOP_N_GENES} genes", flush=True)
+
+    final_params: dict[str, Any] = {
+        "samples": {
+            "tissue": "Muscle - Skeletal",
+            "sample_type": "RNASEQ",
+            "n_final": int(len(expression.columns)),
+        },
+        "normalization": "CPM (counts / library size * 1e6)",
+        "gene_filter": {
+            "min_cpm": stage1["gene_filter"]["min_cpm"],
+            "min_samples": stage1["gene_filter"]["min_samples"],
+            "n_after_filter": int(expression.shape[0]),
+        },
+        "transformation": "log1p(CPM)",
+        "covariate_correction": {
+            "numeric": NUMERIC_COVARIATES,
+            "categorical": CATEGORICAL_COVARIATES,
+            "missing_category": COVARIATE_MISSING_CATEGORY,
+            "categorical_encoding": "dummy-coded with the first level omitted",
+            "method": "joint least-squares regression with standardized covariates; gene means restored",
+        },
+        "gene_selection": {
+            "method": "highest variance after covariate correction",
+            "top_n": TOP_N_GENES,
+            "n_selected": int(top_expression.shape[0]),
+        },
+        "pca_components": PCA_DIAGNOSTIC_COMPONENTS,
+        "pca_random_state": PCA_RANDOM_STATE,
+        "final_matrix_shape": [int(n) for n in top_expression.shape],
+    }
+
+    eda: dict[str, Any] = {
+        "sample_correlation": {
+            "mean_range": [float(mean_sample_corr.min()), float(mean_sample_corr.max())],
+        },
+        "pca_before_correction": {
+            "variance_explained_first_3": [
+                float(value) for value in pca_before.explained_variance_ratio_[:3]
+            ],
+        },
+        "pca_after_correction": {
+            "variance_explained_first_3": [
+                float(value) for value in pca_after.explained_variance_ratio_[:3]
+            ],
+            "correlations_with_corrected_covariates": corrected_covariate_correlations,
+        },
+        "final_matrix_shape": [int(value) for value in top_expression.shape],
+    }
+
+    figures = PROCESSED / "eda_figures"
+    _save_eda_figures(expression, sample_corr, pca_before, scores_before, scores_after, metadata, figures)
+    print("Saved EDA figures", flush=True)
+    top_expression.to_parquet(PROCESSED / "muscle_logcpm_corrected_top5000.parquet")
+    metadata.to_parquet(PROCESSED / "muscle_metadata.parquet")
+    write_json(PROCESSED / "preprocessing_params.json", final_params, allow_nan=False)
+    write_json(PROCESSED / "eda_summary.json", eda, allow_nan=False)
+    print("Saved the selected matrix, metadata and summaries", flush=True)
+    return {"parameters": final_params, "eda": eda, "figures_dir": str(figures)}
+
+
 def _add_sample_traits(metadata: pd.DataFrame, phenotypes: pd.DataFrame) -> pd.DataFrame:
     metadata = metadata.copy()
     sample_ids = pd.Index(metadata.index.astype(str))
@@ -142,135 +272,6 @@ def _save_eda_figures(
     fig.savefig(out_dir / "pca_variance_explained.png", dpi=180)
     plt.close(fig)
     # EDA graph-only section ends.
-
-
-def run() -> dict[str, Any]:
-    expression = pd.read_parquet(PROCESSED / "muscle_logcpm_filtered.parquet")
-    metadata = pd.read_parquet(PROCESSED / "muscle_metadata_clean.parquet")
-    symbols = pd.read_parquet(PROCESSED / "gene_symbols.parquet")["symbol"]
-    phenotypes = pd.read_csv(
-        DATA / "GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt", sep="\t"
-    )
-    print(f"Loaded clean matrix {expression.shape}; metadata {metadata.shape}", flush=True)
-
-    if not metadata.index.equals(expression.columns):
-        raise ValueError("Sample metadata and expression columns are misaligned")
-    if not symbols.index.equals(expression.index):
-        raise ValueError("Gene symbols and expression rows are misaligned")
-
-    metadata = _add_sample_traits(metadata, phenotypes)
-    sample_corr = expression.corr(method="pearson")
-    print("Computed sample-sample correlations", flush=True)
-    mean_sample_corr = (sample_corr.sum(axis=1) - 1) / (len(sample_corr) - 1)
-
-    pca_before, scores_before = _pca(expression)
-    print("Computed pre-correction PCA", flush=True)
-    numeric_covariates = metadata.loc[:, NUMERIC_COVARIATES].apply(pd.to_numeric, errors="raise")
-    if numeric_covariates.isna().any().any():
-        raise ValueError("A required numeric covariate is missing")
-    covariates = numeric_covariates
-    for name in CATEGORICAL_COVARIATES:
-        categories = metadata[name].astype("string").fillna(COVARIATE_MISSING_CATEGORY)
-        dummies = pd.get_dummies(
-            categories, prefix=name, drop_first=True, dtype=np.float64
-        )
-        covariates = pd.concat([covariates, dummies], axis=1)
-    covariate_sd = covariates.std(axis=0, ddof=1)
-    if covariates.isna().any().any() or (covariate_sd == 0).any():
-        raise ValueError("Covariates contain missing values or a constant column")
-    covariates_z = (covariates - covariates.mean(axis=0)) / covariate_sd
-    design = np.column_stack(
-        [np.ones(len(covariates_z)), covariates_z.to_numpy(dtype=np.float64)]
-    )
-    Y = expression.to_numpy(dtype=np.float64, copy=False).T
-    beta, *_ = np.linalg.lstsq(design, Y, rcond=None)
-    corrected_values = Y - design @ beta + Y.mean(axis=0)
-    print("Regressed covariates from expression matrix", flush=True)
-    corrected = pd.DataFrame(
-        corrected_values.T, index=expression.index, columns=expression.columns
-    )
-    if not np.isfinite(corrected_values).all():
-        raise AssertionError("Covariate-corrected expression has invalid values")
-
-    pca_after, scores_after = _pca(corrected)
-    print("Computed post-correction PCA", flush=True)
-    pc_names = [f"PC{i + 1}" for i in range(PCA_CHECK_COMPONENTS)]
-    pcs_after = pd.DataFrame(
-        scores_after[:, :PCA_CHECK_COMPONENTS], index=corrected.columns, columns=pc_names
-    )
-    corrected_covariate_correlations = {
-        pc: {
-            name: float(numeric_covariates[name].corr(pcs_after[pc]))
-            for name in NUMERIC_COVARIATES
-        }
-        for pc in pcs_after.columns
-    }
-    top_expression = corrected.iloc[
-        np.argsort(-corrected_values.var(axis=0, ddof=1), kind="stable")[:TOP_N_GENES]
-    ]
-    if top_expression.shape != (TOP_N_GENES, len(expression.columns)):
-        raise AssertionError("Final top-variance matrix has an unexpected shape")
-    print(f"Selected top {TOP_N_GENES} genes", flush=True)
-
-    final_params: dict[str, Any] = {
-        "samples": {
-            "tissue": "Muscle - Skeletal",
-            "sample_type": "RNASEQ",
-            "n_final": int(len(expression.columns)),
-        },
-        "normalization": "CPM (counts / library size * 1e6)",
-        "gene_filter": {
-            "min_cpm": 1.0,
-            "min_samples": 10,
-            "n_after_filter": int(expression.shape[0]),
-        },
-        "transformation": "log1p(CPM)",
-        "covariate_correction": {
-            "numeric": NUMERIC_COVARIATES,
-            "categorical": CATEGORICAL_COVARIATES,
-            "missing_category": COVARIATE_MISSING_CATEGORY,
-            "categorical_encoding": "dummy-coded with the first level omitted",
-            "method": "joint least-squares regression with standardized covariates; gene means restored",
-        },
-        "gene_selection": {
-            "method": "highest variance after covariate correction",
-            "top_n": TOP_N_GENES,
-            "n_selected": int(top_expression.shape[0]),
-        },
-        "pca_components": PCA_DIAGNOSTIC_COMPONENTS,
-        "pca_random_state": PCA_RANDOM_STATE,
-        "final_matrix_shape": [int(n) for n in top_expression.shape],
-    }
-
-    eda: dict[str, Any] = {
-        "sample_correlation": {
-            "mean_range": [float(mean_sample_corr.min()), float(mean_sample_corr.max())],
-        },
-        "pca_before_correction": {
-            "variance_explained_first_3": [
-                float(value) for value in pca_before.explained_variance_ratio_[:3]
-            ],
-        },
-        "pca_after_correction": {
-            "variance_explained_first_3": [
-                float(value) for value in pca_after.explained_variance_ratio_[:3]
-            ],
-            "correlations_with_corrected_covariates": corrected_covariate_correlations,
-        },
-        "final_matrix_shape": [int(value) for value in top_expression.shape],
-    }
-
-    figures = PROCESSED / "eda_figures"
-    _save_eda_figures(expression, sample_corr, pca_before, scores_before, scores_after, metadata, figures)
-    print("Saved EDA figures", flush=True)
-    top_expression.to_parquet(PROCESSED / "muscle_logcpm_corrected_top5000.parquet")
-    metadata.to_parquet(PROCESSED / "muscle_metadata.parquet")
-    symbols.to_frame("symbol").to_parquet(PROCESSED / "gene_symbols.parquet")
-    write_json(PROCESSED / "preprocessing_params.json", final_params, allow_nan=False)
-    write_json(PROCESSED / "eda_summary.json", eda, allow_nan=False)
-    print("Saved the selected matrix, metadata, symbols and summaries", flush=True)
-    return {"parameters": final_params, "eda": eda, "figures_dir": str(figures)}
-
 
 if __name__ == "__main__":
     result = run()

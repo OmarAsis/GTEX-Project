@@ -17,15 +17,21 @@ COUNTS_FILE_PATTERN = "GTEx_Analysis_*_v8_RNASeQCv1.1.9_gene_reads.gct.gz"
 ATTRIBUTES_FILENAME = "GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
 
 
-def standardize_gene_ids(ids: pd.Series) -> pd.Series:
-    """Trim IDs and remove Ensembl version suffixes while preserving other IDs."""
-    result = ids.astype("string").str.strip()
-    return result.str.replace(r"\.\d+$", "", regex=True)
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data")
+    parser.add_argument("--output-dir", type=Path, default=PROCESSED)
+    parser.add_argument("--min-cpm", type=float, default=1.0)
+    parser.add_argument("--min-samples", type=int, default=10)
+    args = parser.parse_args()
 
-
-def _first_nonmissing(values: pd.Series) -> Any:
-    nonmissing = values.dropna()
-    return nonmissing.iloc[0] if not nonmissing.empty else pd.NA
+    if args.min_cpm < 0 or args.min_samples < 1:
+        parser.error("--min-cpm must be >= 0 and --min-samples must be >= 1")
+    expression, metadata, symbols, audit = preprocess_gtex_muscle(
+        args.data_dir, min_cpm=args.min_cpm, min_samples=args.min_samples
+    )
+    save_outputs(expression, metadata, symbols, audit, args.output_dir)
+    print(json.dumps(audit, indent=2))
 
 
 def preprocess_gtex_muscle(
@@ -60,7 +66,6 @@ def preprocess_gtex_muscle(
     usable_ids = set(usable_metadata["SAMPID"])
 
     raw_columns = pd.read_csv(
-        #first two rows are metadata-note to self
         counts_path, sep="\t", skiprows=2, nrows=0
     ).columns.tolist()
     count_sample_columns = raw_columns[2:]
@@ -174,6 +179,17 @@ def preprocess_gtex_muscle(
     return log_expression, metadata, symbols, audit
 
 
+def standardize_gene_ids(ids: pd.Series) -> pd.Series:
+    """Trim IDs and remove Ensembl version suffixes while preserving other IDs."""
+    result = ids.astype("string").str.strip()
+    return result.str.replace(r"\.\d+$", "", regex=True)
+
+
+def _first_nonmissing(values: pd.Series) -> Any:
+    nonmissing = values.dropna()
+    return nonmissing.iloc[0] if not nonmissing.empty else pd.NA
+
+
 def save_outputs(
     expression: pd.DataFrame,
     metadata: pd.DataFrame,
@@ -189,24 +205,6 @@ def save_outputs(
     # this canonical map can be consumed directly and avoids a duplicate file.
     symbols.to_frame().to_parquet(output_dir / "gene_symbols.parquet")
     write_json(output_dir / "preprocessing_stage1_params.json", audit)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data")
-    parser.add_argument("--output-dir", type=Path, default=PROCESSED)
-    parser.add_argument("--min-cpm", type=float, default=1.0)
-    parser.add_argument("--min-samples", type=int, default=10)
-    args = parser.parse_args()
-
-    if args.min_cpm < 0 or args.min_samples < 1:
-        parser.error("--min-cpm must be >= 0 and --min-samples must be >= 1")
-    expression, metadata, symbols, audit = preprocess_gtex_muscle(
-        args.data_dir, min_cpm=args.min_cpm, min_samples=args.min_samples
-    )
-    save_outputs(expression, metadata, symbols, audit, args.output_dir)
-    print(json.dumps(audit, indent=2))
-
 
 if __name__ == "__main__":
     main()
