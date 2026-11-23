@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import textwrap
 from typing import Any
 
@@ -33,8 +32,78 @@ from scipy.spatial.distance import pdist
 
 from shared.pipeline_utils import write_json
 
-def _module_order(values: pd.Series) -> list[str]:
-    return sorted(values.unique(), key=lambda value: int(value[1:]))
+def run() -> dict[str, Any]:
+    expression = pd.read_parquet(PROCESSED / "muscle_logcpm_corrected_top5000.parquet")
+    metadata = pd.read_parquet(PROCESSED / "muscle_metadata.parquet")
+    membership = pd.read_parquet(PROCESSED / "module_membership_louvain_res1.0.parquet")
+    module_summary = pd.read_parquet(PROCESSED / "module_summary_louvain_res1.0.parquet")
+    eigengenes = pd.read_parquet(PROCESSED / "module_eigengenes_louvain_res1.0.parquet")
+    eigengene_correlations = pd.read_parquet(
+        PROCESSED / "module_eigengene_correlations_louvain_res1.0.parquet"
+    )
+    edges = pd.read_parquet(PROCESSED / "network_edges_pearson_abs0.65.parquet")
+    enrichment = pd.read_parquet(PROCESSED / "enrichment" / "module_enrichment_all_tests.parquet")
+    if expression.shape != (5_000, 803):
+        raise ValueError(f"Expected locked matrix 5,000 x 803, got {expression.shape}")
+    if not metadata.index.equals(expression.columns):
+        raise ValueError("Sample metadata does not align with expression columns")
+    if not eigengenes.index.equals(expression.columns):
+        raise ValueError("Module eigengenes do not align with expression samples")
+    if membership["gene_id"].nunique() != 5_000:
+        raise ValueError("Every selected gene must have exactly one module assignment")
+    if set(enrichment["module_id"].unique()) != set(module_summary["module_id"]):
+        raise ValueError("Enrichment results do not match the v2 module IDs")
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+
+    heatmap = _save_heatmap(expression, metadata, membership, eigengenes)
+    size_plot = _save_module_sizes(module_summary)
+    eigengene_similarity = _save_eigengene_similarity(eigengene_correlations)
+    expression_patterns = _save_expression_patterns(eigengenes, metadata)
+    enrichment_plot = _save_enrichment_dotplot(enrichment)
+    networks = _save_representative_networks(membership, edges)
+    hubs = _save_module_hubs(membership)
+    figures = [
+        f"module_visualizations/{heatmap['figure']}",
+        f"module_visualizations/{size_plot}",
+        f"module_visualizations/{eigengene_similarity}",
+        f"module_visualizations/{expression_patterns}",
+        f"module_visualizations/{enrichment_plot['figure']}",
+        f"module_visualizations/{networks['figure']}",
+        f"module_visualizations/{hubs['figure']}",
+    ]
+    report = {
+        "status": "PASS",
+        "input": {
+            "matrix": "muscle_logcpm_corrected_top5000.parquet",
+            "shape": list(expression.shape),
+            "module_membership": "module_membership_louvain_res1.0.parquet",
+            "network_edges": "network_edges_pearson_abs0.65.parquet",
+            "enrichment": "enrichment/module_enrichment_all_tests.parquet",
+            "module_count": int(module_summary["module_id"].nunique()),
+            "module_genes": int(membership["module_id"].ne("M0").sum()),
+            "threshold_r": NETWORK_THRESHOLD,
+            "threshold_and_resolution_status": "provisional; later resampling and method comparison remain",
+        },
+        "heatmap": heatmap,
+        "module_size_plot": size_plot,
+        "eigengene_similarity_plot": eigengene_similarity,
+        "expression_patterns_plot": expression_patterns,
+        "enrichment_dotplot": enrichment_plot,
+        "representative_networks": networks,
+        "hub_plot": hubs,
+        "figures": figures,
+    }
+    write_json(OUTPUT / "module_visualizations.json", report, allow_nan=False)
+    print(json.dumps({
+        "status": report["status"],
+        "input": report["input"],
+        "heatmap": report["heatmap"],
+        "enrichment_dotplot": report["enrichment_dotplot"],
+        "representative_networks": report["representative_networks"],
+        "hub_plot": {key: value for key, value in report["hub_plot"].items() if key != "top_hubs"},
+        "figures": report["figures"],
+    }, indent=2, allow_nan=False), flush=True)
+    return report
 
 
 def _save_heatmap(
@@ -119,6 +188,10 @@ def _save_heatmap(
         "sample_order_method": "average-linkage hierarchical clustering on module eigengene profiles using correlation distance",
         "death_class_categories": categories,
     }
+
+
+def _module_order(values: pd.Series) -> list[str]:
+    return sorted(values.unique(), key=lambda value: int(value[1:]))
 
 
 def _save_module_sizes(module_summary: pd.DataFrame) -> str:
@@ -255,12 +328,12 @@ def _save_representative_networks(
         maximum = max(float(degrees.max()), 1.0) if len(degrees) else 1.0
         sizes = 90 + 280 * degrees / maximum
         kme = rows["kME"].fillna(0).to_numpy(dtype=float)
-        for gene_1, gene_2, data in subgraph.edges(data=True):
-            nx.draw_networkx_edges(
-                subgraph, positions, edgelist=[(gene_1, gene_2)], ax=ax,
-                width=0.35 + 3.0 * (float(data["weight"]) - NETWORK_THRESHOLD),
-                alpha=0.35, edge_color="#667085",
-            )
+        nx.draw_networkx_edges(
+            subgraph, positions, ax=ax,
+            width=[0.35 + 3.0 * (data["weight"] - NETWORK_THRESHOLD)
+                   for _, _, data in subgraph.edges(data=True)],
+            alpha=0.35, edge_color="#667085",
+        )
         nodes = nx.draw_networkx_nodes(
             subgraph, positions, nodelist=chosen, node_size=sizes,
             node_color=kme, cmap="viridis", vmin=0, vmax=1,
@@ -332,81 +405,6 @@ def _save_module_hubs(membership: pd.DataFrame) -> dict[str, Any]:
     plt.close(fig)
     return {"figure": name, "modules": len(module_ids), "hubs_plotted": int(len(hubs)),
             "top_hubs": hubs[["module_id", "hub_rank", "symbol", "gene_id", "within_module_degree"]].to_dict(orient="records")}
-
-
-def run() -> dict[str, Any]:
-    expression = pd.read_parquet(PROCESSED / "muscle_logcpm_corrected_top5000.parquet")
-    metadata = pd.read_parquet(PROCESSED / "muscle_metadata.parquet")
-    membership = pd.read_parquet(PROCESSED / "module_membership_louvain_res1.0.parquet")
-    module_summary = pd.read_parquet(PROCESSED / "module_summary_louvain_res1.0.parquet")
-    eigengenes = pd.read_parquet(PROCESSED / "module_eigengenes_louvain_res1.0.parquet")
-    eigengene_correlations = pd.read_parquet(
-        PROCESSED / "module_eigengene_correlations_louvain_res1.0.parquet"
-    )
-    edges = pd.read_parquet(PROCESSED / "network_edges_pearson_abs0.65.parquet")
-    enrichment = pd.read_parquet(PROCESSED / "enrichment" / "module_enrichment_all_tests.parquet")
-    if expression.shape != (5_000, 803):
-        raise ValueError(f"Expected locked matrix 5,000 x 803, got {expression.shape}")
-    if not metadata.index.equals(expression.columns):
-        raise ValueError("Sample metadata does not align with expression columns")
-    if not eigengenes.index.equals(expression.columns):
-        raise ValueError("Module eigengenes do not align with expression samples")
-    if membership["gene_id"].nunique() != 5_000:
-        raise ValueError("Every selected gene must have exactly one module assignment")
-    if set(enrichment["module_id"].unique()) != set(module_summary["module_id"]):
-        raise ValueError("Enrichment results do not match the v2 module IDs")
-    OUTPUT.mkdir(parents=True, exist_ok=True)
-
-    heatmap = _save_heatmap(expression, metadata, membership, eigengenes)
-    size_plot = _save_module_sizes(module_summary)
-    eigengene_similarity = _save_eigengene_similarity(eigengene_correlations)
-    expression_patterns = _save_expression_patterns(eigengenes, metadata)
-    enrichment_plot = _save_enrichment_dotplot(enrichment)
-    networks = _save_representative_networks(membership, edges)
-    hubs = _save_module_hubs(membership)
-    figures = [
-        f"module_visualizations/{heatmap['figure']}",
-        f"module_visualizations/{size_plot}",
-        f"module_visualizations/{eigengene_similarity}",
-        f"module_visualizations/{expression_patterns}",
-        f"module_visualizations/{enrichment_plot['figure']}",
-        f"module_visualizations/{networks['figure']}",
-        f"module_visualizations/{hubs['figure']}",
-    ]
-    report = {
-        "status": "PASS",
-        "input": {
-            "matrix": "muscle_logcpm_corrected_top5000.parquet",
-            "shape": list(expression.shape),
-            "module_membership": "module_membership_louvain_res1.0.parquet",
-            "network_edges": "network_edges_pearson_abs0.65.parquet",
-            "enrichment": "enrichment/module_enrichment_all_tests.parquet",
-            "module_count": int(module_summary["module_id"].nunique()),
-            "module_genes": int(membership["module_id"].ne("M0").sum()),
-            "threshold_r": NETWORK_THRESHOLD,
-            "threshold_and_resolution_status": "provisional; later resampling and method comparison remain",
-        },
-        "heatmap": heatmap,
-        "module_size_plot": size_plot,
-        "eigengene_similarity_plot": eigengene_similarity,
-        "expression_patterns_plot": expression_patterns,
-        "enrichment_dotplot": enrichment_plot,
-        "representative_networks": networks,
-        "hub_plot": hubs,
-        "figures": figures,
-    }
-    write_json(OUTPUT / "module_visualizations.json", report, allow_nan=False)
-    print(json.dumps({
-        "status": report["status"],
-        "input": report["input"],
-        "heatmap": report["heatmap"],
-        "enrichment_dotplot": report["enrichment_dotplot"],
-        "representative_networks": report["representative_networks"],
-        "hub_plot": {key: value for key, value in report["hub_plot"].items() if key != "top_hubs"},
-        "figures": report["figures"],
-    }, indent=2, allow_nan=False), flush=True)
-    return report
-
 
 if __name__ == "__main__":
     run()

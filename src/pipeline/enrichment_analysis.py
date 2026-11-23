@@ -32,56 +32,218 @@ from scipy.stats import hypergeom, spearmanr
 
 from shared.pipeline_utils import write_json
 
+_GO_SOURCE = "Gene Ontology Consortium data served by Enrichr"
+_GO_URL = "https://geneontology.org/docs/go-citation-policy/"
 LIBRARIES = {
-    "GO_BP": {
-        "name": "GO_Biological_Process_2023",
-        "source": "Gene Ontology Consortium data served by Enrichr",
-        "url": "https://geneontology.org/docs/go-citation-policy/",
-    },
-    "GO_MF": {
-        "name": "GO_Molecular_Function_2023",
-        "source": "Gene Ontology Consortium data served by Enrichr",
-        "url": "https://geneontology.org/docs/go-citation-policy/",
-    },
-    "GO_CC": {
-        "name": "GO_Cellular_Component_2023",
-        "source": "Gene Ontology Consortium data served by Enrichr",
-        "url": "https://geneontology.org/docs/go-citation-policy/",
-    },
-    "KEGG": {
-        "name": "KEGG_2021_Human",
-        "source": "KEGG human pathway library served by Enrichr",
-        "url": "https://www.kegg.jp/kegg/",
-    },
-    "Reactome": {
-        "name": "Reactome_2022",
-        "source": "Reactome pathway library served by Enrichr",
-        "url": "https://reactome.org/download/",
-    },
-    "Hallmark": {
-        "name": "MSigDB_Hallmark_2020",
-        "source": "MSigDB Hallmark collection served by Enrichr",
-        "url": "https://www.gsea-msigdb.org/gsea/msigdb/collections.jsp",
-    },
+    key: {"name": name, "source": source, "url": url}
+    for key, name, source, url in (
+        ("GO_BP", "GO_Biological_Process_2023", _GO_SOURCE, _GO_URL),
+        ("GO_MF", "GO_Molecular_Function_2023", _GO_SOURCE, _GO_URL),
+        ("GO_CC", "GO_Cellular_Component_2023", _GO_SOURCE, _GO_URL),
+        ("KEGG", "KEGG_2021_Human", "KEGG human pathway library served by Enrichr", "https://www.kegg.jp/kegg/"),
+        ("Reactome", "Reactome_2022", "Reactome pathway library served by Enrichr", "https://reactome.org/download/"),
+        ("Hallmark", "MSigDB_Hallmark_2020", "MSigDB Hallmark collection served by Enrichr", "https://www.gsea-msigdb.org/gsea/msigdb/collections.jsp"),
+    )
 }
+
+
+def run() -> dict[str, Any]:
+    expression = pd.read_parquet(PROCESSED / MATRIX_NAME)
+    symbols = pd.read_parquet(PROCESSED / "gene_symbols.parquet")["symbol"].reindex(expression.index)
+    membership = pd.read_parquet(PROCESSED / "module_membership_louvain_res1.0.parquet")
+    if expression.shape != (5_000, 803):
+        raise ValueError(f"Expected locked 5,000 x 803 matrix, got {expression.shape}")
+    if not expression.index.is_unique or symbols.isna().any():
+        raise ValueError("Selected expression genes must have unique IDs and a symbol mapping")
+    if symbols.duplicated().any():
+        raise ValueError("Selected expression gene symbols are not one-to-one; resolve aliases before ORA")
+    if membership["gene_id"].nunique() != len(expression.index):
+        raise ValueError("Module membership must map every selected gene exactly once")
+    if set(membership["gene_id"]) != set(expression.index.astype(str)):
+        raise ValueError("Module membership IDs do not match the selected expression matrix")
+
+    background = sorted(symbols.astype(str).unique().tolist())
+    gene_to_symbol = symbols.astype(str).to_dict()
+    module_ids = sorted(
+        membership.loc[membership["module_id"] != "M0", "module_id"].unique(),
+        key=lambda value: int(value[1:]),
+    )
+    module_symbols = {
+        module_id: sorted({gene_to_symbol[gene] for gene in membership.loc[membership["module_id"] == module_id, "gene_id"]})
+        for module_id in module_ids
+    }
+    if any(len(values) < 10 for values in module_symbols.values()):
+        raise ValueError("A characterized module has fewer than 10 unique symbols")
+    if len(set().union(*(set(values) for values in module_symbols.values()))) > len(background):
+        raise AssertionError("Module symbol union exceeds the selected background")
+
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    library_metadata: dict[str, Any] = {}
+    library_gene_unions: dict[str, set[str]] = {}
+    all_results: list[pd.DataFrame] = []
+    for library_key, config in LIBRARIES.items():
+        gene_sets, metadata = _load_gene_sets(config["name"])
+        library_gene_unions[library_key] = set().union(
+            *(set(genes) for genes in gene_sets.values())
+        ) & set(background)
+        terms, matrix, term_sizes, term_genes = _term_matrix(gene_sets, background)
+        if not terms:
+            raise ValueError(f"No {library_key} terms passed the {MIN_TERM_SIZE}–{MAX_TERM_SIZE} background-size filter")
+        library_metadata[library_key] = {
+            **metadata,
+            "source": config["source"],
+            "citation_url": config["url"],
+            "terms_tested_per_module": len(terms),
+            "genes_annotated_in_background": int(len(library_gene_unions[library_key])),
+        }
+        result = _run_ora_for_library(
+            library_key, terms, matrix, term_sizes, term_genes, background, module_symbols
+        )
+        all_results.append(result)
+
+    results = _apply_fdr_scopes(pd.concat(all_results, ignore_index=True))
+
+    all_results_path = OUTPUT / "module_enrichment_all_tests.parquet"
+    results.to_parquet(all_results_path, index=False)
+    global_hits = results.loc[results["significant_global_all_tests"]].copy()
+
+    library_summary_rows = []
+    for library_key in LIBRARIES:
+        sub = results.loc[results["library"] == library_key]
+        library_summary_rows.append({
+            "library": library_key,
+            "library_name": LIBRARIES[library_key]["name"],
+            "terms_tested_per_module": library_metadata[library_key]["terms_tested_per_module"],
+            "modules_tested": len(module_ids),
+            "tests_total": len(sub),
+            "raw_p_lt_0_05_all_tests": int((sub["p_value"] < FDR_ALPHA).sum()),
+            "raw_p_lt_0_05_overlap_ge_3": int((sub["reported_overlap"] & (sub["p_value"] < FDR_ALPHA)).sum()),
+            "nominal_expected_raw_hits_if_uniform": float(FDR_ALPHA * len(sub)),
+            "module_library_fdr_lt_0_05_overlap_ge_3": int(sub["significant_module_library"].sum()),
+            "global_fdr_lt_0_05_overlap_ge_3": int(sub["significant_global_all_tests"].sum()),
+        })
+    library_summary = pd.DataFrame(library_summary_rows)
+    library_summary.to_parquet(OUTPUT / "enrichment_library_summary.parquet", index=False)
+
+    module_summary_rows = []
+    for module_id in module_ids:
+        sub = results.loc[results["module_id"] == module_id]
+        reportable_sub = sub.loc[sub["reported_overlap"]]
+        top_terms = global_hits.loc[global_hits["module_id"] == module_id].sort_values("fdr_global_all_tests").head(5)
+        module_summary_rows.append({
+            "module_id": module_id,
+            "module_genes": len(module_symbols[module_id]),
+            "tests_total": len(sub),
+            "reportable_terms_overlap_ge_3": len(reportable_sub),
+            "module_library_fdr_significant_terms": int(sub["significant_module_library"].sum()),
+            "global_fdr_significant_terms": int(sub["significant_global_all_tests"].sum()),
+            "best_global_fdr": float(sub["fdr_global_all_tests"].min()),
+            "top_global_terms": [
+                {"library": row.library, "term": row.term, "overlap": int(row.overlap),
+                 "fold_enrichment": float(row.fold_enrichment), "fdr": float(row.fdr_global_all_tests),
+                 "overlap_genes": row.overlap_genes}
+                for row in top_terms.itertuples(index=False)
+            ],
+        })
+    module_summary = pd.DataFrame(module_summary_rows)
+
+    all_annotated = set().union(*library_gene_unions.values())
+    module_summary["module_symbols_annotated_any_library"] = module_summary["module_id"].map(
+        {module_id: len(set(values) & all_annotated) for module_id, values in module_symbols.items()}
+    )
+    module_summary["module_annotation_fraction"] = (
+        module_summary["module_symbols_annotated_any_library"] / module_summary["module_genes"]
+    )
+    module_summary.to_parquet(OUTPUT / "enrichment_module_summary.parquet", index=False)
+
+    size_term_correlation = spearmanr(
+        module_summary["module_genes"], module_summary["global_fdr_significant_terms"]
+    )
+    significance_counts = (
+        global_hits.groupby(["module_id", "library"]).size().unstack(fill_value=0)
+        .reindex(index=module_ids, columns=list(LIBRARIES), fill_value=0)
+    )
+    figure_files = _write_figures(module_summary, significance_counts, list(LIBRARIES))
+    report = {
+        "status": "PASS",
+        "input": {
+            "matrix": MATRIX_NAME,
+            "shape": list(expression.shape),
+            "orientation": "rows=genes, columns=samples",
+            "module_assignments": "module_membership_louvain_res1.0.parquet",
+            "module_resolution": 1.0,
+            "threshold_r": 0.65,
+            "threshold_and_resolution_status": "provisional pending stability and comparative analysis",
+        },
+        "method": {
+            "test": "one-sided hypergeometric over-representation test",
+            "background": "all 5,000 unique selected gene symbols",
+            "background_size": len(background),
+            "module_count": len(module_ids),
+            "min_term_size_in_background": MIN_TERM_SIZE,
+            "max_term_size_in_background": MAX_TERM_SIZE,
+            "minimum_reported_overlap": MIN_OVERLAP_TO_REPORT,
+            "background_includes_selected_genes_unannotated_in_a_library": True,
+            "fdr_alpha": FDR_ALPHA,
+            "correction_scopes": [
+                "within each module x library",
+                "across every tested module x library x term",
+            ],
+            "p_value_correction_applied_before_overlap_reporting_filter": True,
+            "raw_gene_set_files_copied_into_project": False,
+            "gseapy_version": gp.__version__,
+        },
+        "libraries": library_metadata,
+        "totals": {
+            "tests_total": int(len(results)),
+            "reportable_terms_overlap_ge_3": int(results["reported_overlap"].sum()),
+            "raw_p_lt_0_05_all_tests": int((results["p_value"] < FDR_ALPHA).sum()),
+            "raw_p_lt_0_05_overlap_ge_3": int((results["reported_overlap"] & (results["p_value"] < FDR_ALPHA)).sum()),
+            "module_library_fdr_hits": int(results["significant_module_library"].sum()),
+            "global_fdr_hits": int(results["significant_global_all_tests"].sum()),
+            "nominal_expected_raw_hits_if_uniform": float(FDR_ALPHA * len(results)),
+            "nominal_expectation_note": "Reference only; discrete hypergeometric p-values are not exactly uniform.",
+        },
+        "module_size_vs_global_fdr_term_count_spearman": {
+            "rho": float(size_term_correlation.statistic),
+            "p_value": float(size_term_correlation.pvalue),
+            "interpretation": "descriptive only; module size affects power and library coverage varies",
+        },
+        "outputs": {
+            "all_tests": str(all_results_path.relative_to(PROCESSED)),
+            "library_summary": "enrichment/enrichment_library_summary.parquet",
+            "module_summary": "enrichment/enrichment_module_summary.parquet",
+            "figures": figure_files,
+        },
+    }
+    write_json(OUTPUT / "enrichment_analysis.json", _safe_json(report), allow_nan=False)
+    print(json.dumps({
+        "status": report["status"],
+        "input": report["input"],
+        "method": report["method"],
+        "library_summary": library_summary.to_dict(orient="records"),
+        "module_summary": module_summary[[
+            "module_id", "module_genes", "module_symbols_annotated_any_library",
+            "global_fdr_significant_terms", "best_global_fdr",
+        ]].to_dict(orient="records"),
+        "totals": report["totals"],
+        "module_size_vs_global_fdr_term_count_spearman": report["module_size_vs_global_fdr_term_count_spearman"],
+        "outputs": report["outputs"],
+    }, indent=2, allow_nan=False), flush=True)
+    return report
 
 
 def _load_gene_sets(library_name: str) -> tuple[dict[str, set[str]], dict[str, Any]]:
     cache_file = Path.home() / ".cache" / "gseapy" / f"Enrichr.{library_name}.gmt"
-    if cache_file.is_file():
+    cached = cache_file.is_file()
+    if cached:
         gene_sets = gp.read_gmt(str(cache_file))
         source_type = "GSEApy local Enrichr cache"
-        digest = hashlib.sha256(cache_file.read_bytes()).hexdigest()
-        file_bytes = cache_file.stat().st_size
     else:
         gene_sets = gp.get_library(library_name, organism="Human")
         source_type = "GSEApy/Enrichr library download"
-        file_bytes = None
-        if cache_file.is_file():
-            digest = hashlib.sha256(cache_file.read_bytes()).hexdigest()
-            file_bytes = cache_file.stat().st_size
-        else:
-            digest = None
+    file_bytes = cache_file.stat().st_size if cache_file.is_file() else None
+    digest = hashlib.sha256(cache_file.read_bytes()).hexdigest() if file_bytes is not None else None
     normalized = {str(term): set(map(str, genes)) for term, genes in gene_sets.items()}
     if not normalized:
         raise ValueError(f"Gene-set library {library_name} is empty")
@@ -113,7 +275,7 @@ def _term_matrix(
                 row_indices.append(term_position)
                 column_indices.append(positions[gene])
     matrix = sparse.csr_matrix(
-        (np.ones(len(row_indices), dtype=np.int8), (row_indices, column_indices)),
+        (np.ones(len(row_indices), dtype=np.int32), (row_indices, column_indices)),
         shape=(len(terms), len(background)),
     )
     sizes = np.asarray(matrix.sum(axis=1)).ravel().astype(np.int64)
@@ -130,16 +292,22 @@ def _run_ora_for_library(
     module_symbols: dict[str, list[str]],
 ) -> pd.DataFrame:
     background_size = len(background)
+    background_set = set(background)
+    members_by_module = {module_id: set(symbols) & background_set for module_id, symbols in module_symbols.items()}
+    membership = np.column_stack([
+        np.fromiter((gene in members for gene in background), dtype=np.int32, count=background_size)
+        for members in members_by_module.values()
+    ])
+    all_counts = np.asarray(matrix @ membership)
     rows: list[dict[str, Any]] = []
-    for module_id, symbols in module_symbols.items():
-        members = set(symbols) & set(background)
-        overlap_counts = np.asarray(matrix @ np.isin(background, list(members))).ravel().astype(int)
+    for module_position, (module_id, members) in enumerate(members_by_module.items()):
+        overlap_counts = all_counts[:, module_position]
         module_size = len(members)
         p_values = hypergeom.sf(overlap_counts - 1, background_size, term_sizes, module_size)
         if not np.isfinite(p_values).all():
             raise AssertionError(f"Non-finite enrichment p-value in {library_key}/{module_id}")
         for i, count in enumerate(overlap_counts):
-            overlaps = sorted(members & term_genes[i])
+            overlaps = sorted(members & term_genes[i]) if count else []
             rows.append({
                 "module_id": module_id,
                 "library": library_key,
@@ -151,11 +319,27 @@ def _run_ora_for_library(
                 "overlap": int(count),
                 "overlap_genes": ";".join(overlaps),
                 "p_value": float(p_values[i]),
-                "fold_enrichment": float(
-                    (count / module_size) / (term_sizes[i] / background_size)
-                ) if module_size else None,
+                "fold_enrichment": float((count / module_size) / (term_sizes[i] / background_size)) if module_size else None,
             })
     return pd.DataFrame(rows)
+
+
+def _apply_fdr_scopes(results: pd.DataFrame) -> pd.DataFrame:
+    adjusted = results.copy()
+    adjusted["fdr_module_library"] = adjusted.groupby(
+        ["module_id", "library"], sort=False
+    )["p_value"].transform(_bh_fdr)
+    adjusted["fdr_global_all_tests"] = _bh_fdr(adjusted["p_value"].to_numpy())
+    adjusted["reported_overlap"] = adjusted["overlap"] >= MIN_OVERLAP_TO_REPORT
+    adjusted["significant_module_library"] = (
+        adjusted["reported_overlap"] & (adjusted["fdr_module_library"] < FDR_ALPHA)
+    )
+    adjusted["significant_global_all_tests"] = (
+        adjusted["reported_overlap"] & (adjusted["fdr_global_all_tests"] < FDR_ALPHA)
+    )
+    return adjusted.sort_values(
+        ["p_value", "library", "module_id", "term"], kind="mergesort"
+    ).reset_index(drop=True)
 
 
 def _bh_fdr(p_values: np.ndarray) -> np.ndarray:
@@ -221,210 +405,6 @@ def _safe_json(value: Any) -> Any:
     if isinstance(value, (np.floating, float)):
         return float(value) if np.isfinite(value) else None
     return value
-
-
-def run() -> dict[str, Any]:
-    expression = pd.read_parquet(PROCESSED / MATRIX_NAME)
-    symbols = pd.read_parquet(PROCESSED / "gene_symbols.parquet")["symbol"].reindex(expression.index)
-    membership = pd.read_parquet(PROCESSED / "module_membership_louvain_res1.0.parquet")
-    if expression.shape != (5_000, 803):
-        raise ValueError(f"Expected locked 5,000 x 803 matrix, got {expression.shape}")
-    if not expression.index.is_unique or symbols.isna().any():
-        raise ValueError("Selected expression genes must have unique IDs and a symbol mapping")
-    if symbols.duplicated().any():
-        raise ValueError("Selected expression gene symbols are not one-to-one; resolve aliases before ORA")
-    if membership["gene_id"].nunique() != len(expression.index):
-        raise ValueError("Module membership must map every selected gene exactly once")
-    if set(membership["gene_id"]) != set(expression.index.astype(str)):
-        raise ValueError("Module membership IDs do not match the selected expression matrix")
-
-    background = sorted(symbols.astype(str).unique().tolist())
-    gene_to_symbol = symbols.astype(str).to_dict()
-    module_ids = sorted(
-        membership.loc[membership["module_id"] != "M0", "module_id"].unique(),
-        key=lambda value: int(value[1:]),
-    )
-    module_symbols = {
-        module_id: sorted({gene_to_symbol[gene] for gene in membership.loc[membership["module_id"] == module_id, "gene_id"]})
-        for module_id in module_ids
-    }
-    if any(len(values) < 10 for values in module_symbols.values()):
-        raise ValueError("A characterized module has fewer than 10 unique symbols")
-    if len(set().union(*(set(values) for values in module_symbols.values()))) > len(background):
-        raise AssertionError("Module symbol union exceeds the selected background")
-
-    OUTPUT.mkdir(parents=True, exist_ok=True)
-    library_metadata: dict[str, Any] = {}
-    library_gene_unions: dict[str, set[str]] = {}
-    all_results: list[pd.DataFrame] = []
-    for library_key, config in LIBRARIES.items():
-        gene_sets, metadata = _load_gene_sets(config["name"])
-        library_gene_unions[library_key] = set().union(
-            *(set(genes) for genes in gene_sets.values())
-        ) & set(background)
-        terms, matrix, term_sizes, term_genes = _term_matrix(gene_sets, background)
-        if not terms:
-            raise ValueError(f"No {library_key} terms passed the {MIN_TERM_SIZE}–{MAX_TERM_SIZE} background-size filter")
-        library_metadata[library_key] = {
-            **metadata,
-            "source": config["source"],
-            "citation_url": config["url"],
-            "terms_tested_per_module": len(terms),
-            "genes_annotated_in_background": int(len(library_gene_unions[library_key])),
-        }
-        result = _run_ora_for_library(
-            library_key, terms, matrix, term_sizes, term_genes, background, module_symbols
-        )
-        all_results.append(result)
-
-    results = pd.concat(all_results, ignore_index=True)
-    results["fdr_module_library"] = results.groupby(["module_id", "library"], sort=False)["p_value"].transform(_bh_fdr)
-    results["fdr_library_all_modules"] = results.groupby("library", sort=False)["p_value"].transform(_bh_fdr)
-    results["fdr_global_all_tests"] = _bh_fdr(results["p_value"].to_numpy())
-    results["reported_overlap"] = results["overlap"] >= MIN_OVERLAP_TO_REPORT
-    results["significant_module_library"] = results["reported_overlap"] & (results["fdr_module_library"] < FDR_ALPHA)
-    results["significant_library_all_modules"] = results["reported_overlap"] & (results["fdr_library_all_modules"] < FDR_ALPHA)
-    results["significant_global_all_tests"] = results["reported_overlap"] & (results["fdr_global_all_tests"] < FDR_ALPHA)
-    results = results.sort_values(["p_value", "library", "module_id", "term"], kind="mergesort").reset_index(drop=True)
-
-    all_results_path = OUTPUT / "module_enrichment_all_tests.parquet"
-    results.to_parquet(all_results_path, index=False)
-    reportable = results.loc[results["reported_overlap"]].copy()
-    reportable.to_csv(OUTPUT / "module_enrichment_reportable.csv", index=False)
-    global_hits = results.loc[results["significant_global_all_tests"]].copy()
-    global_hits.to_csv(OUTPUT / "module_enrichment_global_fdr_hits.csv", index=False)
-
-    library_summary_rows = []
-    for library_key in LIBRARIES:
-        sub = results.loc[results["library"] == library_key]
-        library_summary_rows.append({
-            "library": library_key,
-            "library_name": LIBRARIES[library_key]["name"],
-            "terms_tested_per_module": library_metadata[library_key]["terms_tested_per_module"],
-            "modules_tested": len(module_ids),
-            "tests_total": len(sub),
-            "raw_p_lt_0_05_all_tests": int((sub["p_value"] < FDR_ALPHA).sum()),
-            "raw_p_lt_0_05_overlap_ge_3": int((sub["reported_overlap"] & (sub["p_value"] < FDR_ALPHA)).sum()),
-            "nominal_expected_raw_hits_if_uniform": float(FDR_ALPHA * len(sub)),
-            "module_library_fdr_lt_0_05_overlap_ge_3": int(sub["significant_module_library"].sum()),
-            "library_fdr_lt_0_05_overlap_ge_3": int(sub["significant_library_all_modules"].sum()),
-            "global_fdr_lt_0_05_overlap_ge_3": int(sub["significant_global_all_tests"].sum()),
-        })
-    library_summary = pd.DataFrame(library_summary_rows)
-    library_summary.to_parquet(OUTPUT / "enrichment_library_summary.parquet", index=False)
-
-    module_summary_rows = []
-    for module_id in module_ids:
-        sub = results.loc[results["module_id"] == module_id]
-        reportable_sub = sub.loc[sub["reported_overlap"]]
-        top_terms = global_hits.loc[global_hits["module_id"] == module_id].sort_values("fdr_global_all_tests").head(5)
-        module_summary_rows.append({
-            "module_id": module_id,
-            "module_genes": len(module_symbols[module_id]),
-            "tests_total": len(sub),
-            "reportable_terms_overlap_ge_3": len(reportable_sub),
-            "module_library_fdr_significant_terms": int(sub["significant_module_library"].sum()),
-            "library_global_fdr_significant_terms": int(sub["significant_library_all_modules"].sum()),
-            "global_fdr_significant_terms": int(sub["significant_global_all_tests"].sum()),
-            "best_global_fdr": float(sub["fdr_global_all_tests"].min()),
-            "top_global_terms": [
-                {"library": row.library, "term": row.term, "overlap": int(row.overlap),
-                 "fold_enrichment": float(row.fold_enrichment), "fdr": float(row.fdr_global_all_tests),
-                 "overlap_genes": row.overlap_genes}
-                for row in top_terms.itertuples(index=False)
-            ],
-        })
-    module_summary = pd.DataFrame(module_summary_rows)
-
-    all_annotated = set().union(*library_gene_unions.values())
-    module_summary["module_symbols_annotated_any_library"] = module_summary["module_id"].map(
-        {module_id: len(set(values) & all_annotated) for module_id, values in module_symbols.items()}
-    )
-    module_summary["module_annotation_fraction"] = (
-        module_summary["module_symbols_annotated_any_library"] / module_summary["module_genes"]
-    )
-    module_summary.to_parquet(OUTPUT / "enrichment_module_summary.parquet", index=False)
-
-    size_term_correlation = spearmanr(
-        module_summary["module_genes"], module_summary["global_fdr_significant_terms"]
-    )
-    significance_counts = (
-        global_hits.groupby(["module_id", "library"]).size().unstack(fill_value=0)
-        .reindex(index=module_ids, columns=list(LIBRARIES), fill_value=0)
-    )
-    figure_files = _write_figures(module_summary, significance_counts, list(LIBRARIES))
-    report = {
-        "status": "PASS",
-        "input": {
-            "matrix": MATRIX_NAME,
-            "shape": list(expression.shape),
-            "orientation": "rows=genes, columns=samples",
-            "module_assignments": "module_membership_louvain_res1.0.parquet",
-            "module_resolution": 1.0,
-            "threshold_r": 0.65,
-            "threshold_and_resolution_status": "provisional pending stability and comparative analysis",
-        },
-        "method": {
-            "test": "one-sided hypergeometric over-representation test",
-            "background": "all 5,000 unique selected gene symbols",
-            "background_size": len(background),
-            "module_count": len(module_ids),
-            "min_term_size_in_background": MIN_TERM_SIZE,
-            "max_term_size_in_background": MAX_TERM_SIZE,
-            "minimum_reported_overlap": MIN_OVERLAP_TO_REPORT,
-            "background_includes_selected_genes_unannotated_in_a_library": True,
-            "fdr_alpha": FDR_ALPHA,
-            "correction_scopes": [
-                "within each module x library",
-                "within each library across all modules",
-                "across every tested module x library x term",
-            ],
-            "p_value_correction_applied_before_overlap_reporting_filter": True,
-            "raw_gene_set_files_copied_into_project": False,
-            "gseapy_version": gp.__version__,
-        },
-        "libraries": library_metadata,
-        "totals": {
-            "tests_total": int(len(results)),
-            "reportable_terms_overlap_ge_3": int(results["reported_overlap"].sum()),
-            "raw_p_lt_0_05_all_tests": int((results["p_value"] < FDR_ALPHA).sum()),
-            "raw_p_lt_0_05_overlap_ge_3": int((results["reported_overlap"] & (results["p_value"] < FDR_ALPHA)).sum()),
-            "module_library_fdr_hits": int(results["significant_module_library"].sum()),
-            "library_fdr_hits": int(results["significant_library_all_modules"].sum()),
-            "global_fdr_hits": int(results["significant_global_all_tests"].sum()),
-            "nominal_expected_raw_hits_if_uniform": float(FDR_ALPHA * len(results)),
-            "nominal_expectation_note": "Reference only; discrete hypergeometric p-values are not exactly uniform.",
-        },
-        "module_size_vs_global_fdr_term_count_spearman": {
-            "rho": float(size_term_correlation.statistic),
-            "p_value": float(size_term_correlation.pvalue),
-            "interpretation": "descriptive only; module size affects power and library coverage varies",
-        },
-        "outputs": {
-            "all_tests": str(all_results_path.relative_to(PROCESSED)),
-            "reportable_terms": "enrichment/module_enrichment_reportable.csv",
-            "global_fdr_hits": "enrichment/module_enrichment_global_fdr_hits.csv",
-            "library_summary": "enrichment/enrichment_library_summary.parquet",
-            "module_summary": "enrichment/enrichment_module_summary.parquet",
-            "figures": figure_files,
-        },
-    }
-    write_json(OUTPUT / "enrichment_analysis.json", _safe_json(report), allow_nan=False)
-    print(json.dumps({
-        "status": report["status"],
-        "input": report["input"],
-        "method": report["method"],
-        "library_summary": library_summary.to_dict(orient="records"),
-        "module_summary": module_summary[[
-            "module_id", "module_genes", "module_symbols_annotated_any_library",
-            "global_fdr_significant_terms", "best_global_fdr",
-        ]].to_dict(orient="records"),
-        "totals": report["totals"],
-        "module_size_vs_global_fdr_term_count_spearman": report["module_size_vs_global_fdr_term_count_spearman"],
-        "outputs": report["outputs"],
-    }, indent=2, allow_nan=False), flush=True)
-    return report
-
 
 if __name__ == "__main__":
     run()
